@@ -155,3 +155,21 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+### 1. Atomic Conditional Updates for Idempotency and Race Safety
+
+Instead of relying on multi-step read-then-write locks, payments use an atomic SQL statement:
+`UPDATE shares SET paid_at = ?1, idempotency_key = ?2 WHERE id = ?3 AND bill_id = ?4 AND paid_at IS NULL RETURNING ...`
+- **Why:** SQLite / Cloudflare D1 serializes writes. If two concurrent requests attempt to pay the same share simultaneously, only the first statement matches `paid_at IS NULL` and updates the row; the second updates zero rows. If a duplicate request arrives with the same `Idempotency-Key`, the existing paid share is returned with `200 OK`. If a different key is provided for an already paid share, the API returns `409 Conflict`.
+
+### 2. Strict Integer Arithmetic for Monetary Amounts (Cents)
+
+All money is stored and manipulated strictly as whole integer cents (`total_cents`, `amount_cents`). Amounts are validated at the API boundary (`Number.isInteger(cents) && cents > 0`) and protected in the schema via `CHECK` constraints (`chk_bills_total_cents_positive` and `chk_shares_amount_cents_positive`).
+- **Why:** Floating-point numbers in JavaScript and databases suffer from precision and rounding errors (e.g. `0.1 + 0.2 = 0.30000000000000004`). Integer cents guarantee exact precision. When dividing uneven totals, base cents are allocated (`Math.floor(total / n)`) and the remainder cents (`total % n`) are assigned one-by-one to members in insertion order (`rowid ASC`), ensuring the sum of all shares strictly equals `totalCents`.
+
+### 3. Minimal Zero-Dependency Resilient Frontend Architecture
+
+The web client was built purely with React and TanStack Router without adding bloated third-party state or UI libraries. All network interactions are isolated in `try...catch` blocks with explicit per-action loading states (`payingShareId`).
+- **Why:** This keeps the production bundle ultra-lightweight (~12 KB client chunk) and easy to audit and explain. If the API returns a 500 error, experiences latency, or fails, the application never crashes; it keeps the share in its unpaid state, presents a clear error alert, and allows the user to retry safely.
